@@ -508,6 +508,7 @@ async fn run_event_loop(
                     });
                 }
                 let lsn_to_send = confirmed_lsn.map(PgLsn::from).unwrap_or(PgLsn::from(0));
+                debug!("sending status update {}", lsn_to_send);
                 if let Err(e) = stream
                     .as_mut()
                     .send_status_update(lsn_to_send)

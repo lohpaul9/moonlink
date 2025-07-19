@@ -105,7 +105,8 @@ struct TableHandlerState {
     special_table_state: SpecialTableState,
     // Buffered events during blocking operations: initial copy, alter table, drop table, etc.
     initial_copy_buffered_events: Vec<TableEvent>,
-
+    // Whether the wal buffer is currently being flushed.
+    wal_buffer_flushing: bool,
     // ================================================
     // Table maintainence status
     // ================================================
@@ -147,6 +148,7 @@ impl TableHandlerState {
             table_maintenance_completion_tx,
             // Initial copy fields.
             initial_copy_buffered_events: Vec::new(),
+            wal_buffer_flushing: false,
         }
     }
 
@@ -388,10 +390,12 @@ impl TableHandler {
         // Spawn the task to notify periodical events.
         let event_sender_for_periodical_snapshot = event_sender.clone();
         let event_sender_for_periodical_force_snapshot = event_sender.clone();
+        let event_sender_for_periodical_persist_wal = event_sender.clone();
         let periodic_event_handle = tokio::spawn(async move {
             let mut periodic_snapshot_interval = tokio::time::interval(Duration::from_millis(500));
             let mut periodic_force_snapshot_interval =
                 tokio::time::interval(Duration::from_secs(300));
+            let mut periodic_persist_wal_interval = tokio::time::interval(Duration::from_millis(500));
 
             loop {
                 tokio::select! {
@@ -403,6 +407,11 @@ impl TableHandler {
                     }
                     _ = periodic_force_snapshot_interval.tick() => {
                         if event_sender_for_periodical_force_snapshot.send(TableEvent::ForceSnapshot { lsn: None }).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ = periodic_persist_wal_interval.tick() => {
+                        if event_sender_for_periodical_persist_wal.send(TableEvent::PeriodicalPersistWal).await.is_err() {
                             return;
                         }
                     }
@@ -705,7 +714,7 @@ impl TableHandler {
 
                                     // Buffer iceberg persistence result, which later will be reflected to mooncake snapshot.
                                     let iceberg_flush_lsn = snapshot_res.flush_lsn;
-                                    event_sync_sender.flush_lsn_tx.send(iceberg_flush_lsn).unwrap();
+                                    // event_sync_sender.flush_lsn_tx.send(iceberg_flush_lsn).unwrap();
                                     table.set_iceberg_snapshot_res(snapshot_res);
                                     table_handler_state.iceberg_snapshot_result_consumed = false;
 
@@ -762,6 +771,16 @@ impl TableHandler {
                         TableEvent::EvictedDataFilesToDelete { evicted_data_files } => {
                             start_task_to_delete_evicted(evicted_data_files);
                         }
+                        TableEvent::PeriodicalPersistWal => {
+                            if !table_handler_state.wal_buffer_flushing {
+                                table_handler_state.wal_buffer_flushing = true;
+                                table.persist_wal_buffer();
+                            }
+                        }
+                        TableEvent::PeriodicalPersistWalResult => {
+                            assert!(table_handler_state.wal_buffer_flushing);
+                            table_handler_state.wal_buffer_flushing = false;
+                        }
                         // ==============================
                         // Replication events
                         // ==============================
@@ -811,6 +830,10 @@ impl TableHandler {
             is_initial_copy_event,
             table_handler_state.special_table_state == SpecialTableState::InitialCopy
         );
+
+        table
+            .append_to_wal_buffer(event.clone_for_wal_buffer())
+            .await;
 
         match event {
             TableEvent::Append {

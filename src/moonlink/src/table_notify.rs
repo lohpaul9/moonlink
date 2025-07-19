@@ -114,6 +114,10 @@ pub enum TableEvent {
         /// Evicted data files by object storage cache.
         evicted_data_files: Vec<String>,
     },
+    /// Periodically persist in-memory WAL.
+    PeriodicalPersistWal,
+    /// Periodic persist wal completes.
+    PeriodicalPersistWalResult,
 }
 
 impl TableEvent {
@@ -150,6 +154,45 @@ impl TableEvent {
             TableEvent::StreamAbort { .. } => None,
             TableEvent::Flush { lsn } => Some(*lsn),
             _ => None,
+        }
+    }
+
+    /// Clone the event for wal buffer.
+    /// TODO(Paul): Refactor this if we need to support more events.
+    pub fn clone_for_wal_buffer(&self) -> TableEvent {
+        if self.is_ingest_event() {
+            self.clone_with_deep_row_copy()
+        } else {
+            unimplemented!("Clone for wal buffer is not implemented for this event");
+        }
+    }
+
+    fn clone_with_deep_row_copy(&self) -> TableEvent {
+        match self {
+            TableEvent::Append {
+                row,
+                xact_id,
+                lsn,
+                is_copied,
+            } => TableEvent::Append {
+                row: MoonlinkRow::new(row.values.clone()),
+                xact_id: *xact_id,
+                lsn: *lsn,
+                is_copied: *is_copied,
+            },
+            TableEvent::Delete { row, lsn, xact_id } => TableEvent::Delete {
+                row: MoonlinkRow::new(row.values.clone()),
+                lsn: *lsn,
+                xact_id: *xact_id,
+            },
+            TableEvent::Commit { lsn, xact_id } => TableEvent::Commit {
+                lsn: *lsn,
+                xact_id: *xact_id,
+            },
+            TableEvent::StreamAbort { xact_id } => TableEvent::StreamAbort { xact_id: *xact_id },
+            TableEvent::Flush { lsn } => TableEvent::Flush { lsn: *lsn },
+            TableEvent::StreamFlush { xact_id } => TableEvent::StreamFlush { xact_id: *xact_id },
+            _ => unimplemented!("Clone for wal buffer is not implemented for this event"),
         }
     }
 }

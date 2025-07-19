@@ -12,6 +12,7 @@ pub mod table_config;
 pub mod table_secret;
 mod table_snapshot;
 mod transaction_stream;
+mod wal_buffer;
 
 use super::iceberg::puffin_utils::PuffinBlobRef;
 use super::index::index_merge_config::FileIndexMergeConfig;
@@ -40,6 +41,7 @@ pub(crate) use crate::storage::mooncake_table::table_snapshot::{
     IcebergSnapshotDataCompactionResult, IcebergSnapshotImportPayload,
     IcebergSnapshotIndexMergePayload, IcebergSnapshotPayload, IcebergSnapshotResult,
 };
+use crate::storage::mooncake_table::wal_buffer::WalBuffer;
 use crate::storage::storage_utils::{FileId, TableId};
 use crate::table_notify::TableEvent;
 use crate::NonEvictableHandle;
@@ -509,6 +511,9 @@ pub struct MooncakeTable {
 
     /// Table notifier, which is used to sent multiple types of event completion information.
     table_notify: Option<Sender<TableEvent>>,
+
+    /// In-memory WAL
+    wal_buffer: Arc<WalBuffer>,
 }
 
 impl MooncakeTable {
@@ -588,6 +593,7 @@ impl MooncakeTable {
             iceberg_table_manager: Some(table_manager),
             last_iceberg_snapshot_lsn,
             table_notify: None,
+            wal_buffer: Arc::new(WalBuffer::new()),
         })
     }
 
@@ -725,6 +731,24 @@ impl MooncakeTable {
             self.snapshot.clone(),
             self.table_snapshot_watch_receiver.clone(),
         )
+    }
+
+    pub async fn append_to_wal_buffer(&mut self, event: TableEvent) {
+        self.wal_buffer.insert(event).await;
+    }
+
+    async fn persist_wal_buffer_impl(wal_buffer: Arc<WalBuffer>, table_notify: Sender<TableEvent>) {
+        wal_buffer.persist_to_new_file().await;
+        table_notify
+            .send(TableEvent::PeriodicalPersistWalResult)
+            .await
+            .unwrap();
+    }
+
+    pub fn persist_wal_buffer(&self) {
+        let wal_buffer = self.wal_buffer.clone();
+        let table_notify = self.table_notify.as_ref().unwrap().clone();
+        tokio::task::spawn(Self::persist_wal_buffer_impl(wal_buffer, table_notify));
     }
 
     pub fn append(&mut self, row: MoonlinkRow) -> Result<()> {
