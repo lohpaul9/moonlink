@@ -8,7 +8,8 @@ use crate::pg_replicate::postgres_source::{
 use crate::pg_replicate::table_init::build_table_components;
 use crate::Result;
 use moonlink::{
-    MoonlinkTableConfig, ObjectStorageCache, ReadStateManager, TableEventManager, TableStatusReader,
+    MoonlinkTableConfig, ObjectStorageCache, ReadStateManager, TableEventManager,
+    TableStatusReader, WalManager,
 };
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
@@ -294,6 +295,7 @@ impl ReplicationConnection {
             &self.replication_state,
             self.object_storage_cache.clone(),
             moonlink_table_config,
+            is_recovery,
         )
         .await?;
 
@@ -370,6 +372,15 @@ impl ReplicationConnection {
                 }
             });
         } else {
+            if is_recovery {
+                WalManager::replay_recovery_from_wal(
+                    event_sender_clone,
+                    table_resources.wal_persistence_metadata,
+                    table_resources.wal_file_accessor,
+                    table_resources.last_iceberg_snapshot_lsn,
+                )
+                .await?;
+            }
             // If there are no rows to copy, we still need to add the table to publication.
             copy_source
                 .add_table_to_publication(&schema.table_name)
@@ -479,7 +490,9 @@ impl ReplicationConnection {
         }
     }
 
-    pub fn shutdown(mut self) -> JoinHandle<Result<()>> {
+    /// Gives an option to not drop the publication and replication slot, which is
+    /// useful for simulating a crash.
+    pub fn shutdown(mut self, drop_publication_and_replication: bool) -> JoinHandle<Result<()>> {
         tokio::spawn(async move {
             debug!("shutting down replication connection");
             if self.replication_started {
@@ -492,8 +505,10 @@ impl ReplicationConnection {
                 self.replication_started = false;
             }
 
-            self.drop_publication().await?;
-            self.drop_replication_slot().await?;
+            if drop_publication_and_replication {
+                self.drop_publication().await?;
+                self.drop_replication_slot().await?;
+            }
 
             // Wait for any pending retry operations to complete
             self.wait_for_pending_retries().await;
@@ -529,15 +544,15 @@ async fn run_event_loop(
     debug!("replication event loop started");
 
     let mut status_interval = tokio::time::interval(Duration::from_secs(10));
-    let mut flush_lsn_rxs: HashMap<SrcTableId, watch::Receiver<u64>> = HashMap::new();
+    let mut _flush_lsn_rxs: HashMap<SrcTableId, watch::Receiver<u64>> = HashMap::new();
     // TODO(Paul): Currently unused. In preparation for acknowledging latest WAL flush LSN to replication sink.
-    let mut _wal_flush_lsn_rxs: HashMap<SrcTableId, watch::Receiver<u64>> = HashMap::new();
+    let mut wal_flush_lsn_rxs: HashMap<SrcTableId, watch::Receiver<u64>> = HashMap::new();
 
     loop {
         tokio::select! {
             _ = status_interval.tick() => {
                 let mut confirmed_lsn: Option<u64> = None;
-                for rx in flush_lsn_rxs.values() {
+                for rx in wal_flush_lsn_rxs.values() {
                     let lsn = *rx.borrow();
                     confirmed_lsn = Some(match confirmed_lsn {
                         Some(v) => v.min(lsn),
@@ -556,14 +571,14 @@ async fn run_event_loop(
             Some(cmd) = cmd_rx.recv() => match cmd {
                 Command::AddTable { src_table_id, schema, event_sender, commit_lsn_tx, flush_lsn_rx, wal_flush_lsn_rx } => {
                     sink.add_table(src_table_id, event_sender, commit_lsn_tx, &schema);
-                    flush_lsn_rxs.insert(src_table_id, flush_lsn_rx);
-                    _wal_flush_lsn_rxs.insert(src_table_id, wal_flush_lsn_rx);
+                    _flush_lsn_rxs.insert(src_table_id, flush_lsn_rx);
+                    wal_flush_lsn_rxs.insert(src_table_id, wal_flush_lsn_rx);
                     stream.as_mut().add_table_schema(schema);
                 }
                 Command::DropTable { src_table_id } => {
                     sink.drop_table(src_table_id);
-                    flush_lsn_rxs.remove(&src_table_id);
-                    _wal_flush_lsn_rxs.remove(&src_table_id);
+                    _flush_lsn_rxs.remove(&src_table_id);
+                    wal_flush_lsn_rxs.remove(&src_table_id);
                     stream.as_mut().remove_table_schema(src_table_id);
                 }
                 Command::Shutdown => {

@@ -3,11 +3,12 @@ use crate::pg_replicate::table::TableSchema;
 use crate::pg_replicate::util::postgres_schema_to_moonlink_schema;
 use crate::{Error, Result};
 use moonlink::event_sync::create_table_event_syncer;
+use moonlink::PersistentWalMetadata;
 use moonlink::{
-    AccessorConfig, EventSyncReceiver, EventSyncSender, FileSystemAccessor, IcebergTableConfig,
-    MooncakeTable, MooncakeTableConfig, MoonlinkSecretType, MoonlinkTableConfig,
-    MoonlinkTableSecret, ObjectStorageCache, ReadStateManager, StorageConfig, TableEvent,
-    TableEventManager, TableHandler, TableStatusReader, WalConfig,
+    AccessorConfig, BaseFileSystemAccess, EventSyncReceiver, EventSyncSender, FileSystemAccessor,
+    IcebergTableConfig, MooncakeTable, MooncakeTableConfig, MoonlinkSecretType,
+    MoonlinkTableConfig, MoonlinkTableSecret, ObjectStorageCache, ReadStateManager, StorageConfig,
+    TableEvent, TableEventManager, TableHandler, TableStatusReader, WalConfig, WalManager,
 };
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,9 @@ pub struct TableResources {
     pub commit_lsn_tx: watch::Sender<u64>,
     pub flush_lsn_rx: watch::Receiver<u64>,
     pub wal_flush_lsn_rx: watch::Receiver<u64>,
+    pub wal_file_accessor: Arc<dyn BaseFileSystemAccess>,
+    pub wal_persistence_metadata: Option<PersistentWalMetadata>,
+    pub last_iceberg_snapshot_lsn: Option<u64>,
 }
 
 /// Util function to delete and re-create the given directory.
@@ -56,6 +60,7 @@ pub async fn build_table_components(
     replication_state: &ReplicationState,
     object_storage_cache: ObjectStorageCache,
     moonlink_table_config: MoonlinkTableConfig,
+    is_recovery: bool,
 ) -> Result<TableResources> {
     // Recreate write-through cache directory.
     let write_cache_path = PathBuf::from(base_path).join(&mooncake_table_id);
@@ -71,6 +76,29 @@ pub async fn build_table_components(
     let (arrow_schema, identity) = postgres_schema_to_moonlink_schema(table_schema);
     let wal_config =
         WalConfig::default_wal_config_local(&mooncake_table_id, &PathBuf::from(base_path));
+    let wal_file_accessor = Arc::new(FileSystemAccessor::new(
+        wal_config.get_accessor_config().clone(),
+    ));
+
+    let wal_persistence_metadata = {
+        if is_recovery {
+            let recovered_wal_metadata =
+                WalManager::recover_from_persistent_wal_metadata(wal_file_accessor.clone()).await;
+            recovered_wal_metadata
+        } else {
+            None
+        }
+    };
+
+    let wal_manager = if let Some(wal_persistence_metadata) = wal_persistence_metadata.clone() {
+        WalManager::from_persistent_wal_metadata(
+            wal_file_accessor.clone(),
+            wal_persistence_metadata,
+        )
+    } else {
+        WalManager::new(&wal_config)
+    };
+
     let table = MooncakeTable::new(
         arrow_schema,
         table_schema.table_name.to_string(),
@@ -79,7 +107,7 @@ pub async fn build_table_components(
         identity,
         moonlink_table_config.iceberg_table_config.clone(),
         moonlink_table_config.mooncake_table_config.clone(),
-        wal_config,
+        wal_manager,
         object_storage_cache,
         Arc::new(FileSystemAccessor::new(
             moonlink_table_config
@@ -89,6 +117,8 @@ pub async fn build_table_components(
         )),
     )
     .await?;
+
+    let last_iceberg_snapshot_lsn = table.get_iceberg_snapshot_lsn();
 
     let (commit_lsn_tx, commit_lsn_rx) = watch::channel(0u64);
     let read_state_manager =
@@ -117,6 +147,9 @@ pub async fn build_table_components(
         commit_lsn_tx,
         flush_lsn_rx,
         wal_flush_lsn_rx,
+        wal_file_accessor,
+        wal_persistence_metadata,
+        last_iceberg_snapshot_lsn,
     };
     Ok(table_resource)
 }

@@ -149,6 +149,7 @@ impl TestEnvironment {
         let iceberg_table_config =
             get_iceberg_manager_config(table_name.to_string(), path.to_str().unwrap().to_string());
         let wal_config = WalConfig::default_wal_config_local(WAL_TEST_TABLE_ID, temp_dir.path());
+        let wal_manager = WalManager::new(&wal_config);
         let mooncake_table = MooncakeTable::new(
             (*create_test_arrow_schema()).clone(),
             table_name.to_string(),
@@ -157,7 +158,7 @@ impl TestEnvironment {
             IdentityProp::Keys(vec![0]),
             iceberg_table_config.clone(),
             mooncake_table_config,
-            wal_config,
+            wal_manager,
             ObjectStorageCache::default_for_test(&temp_dir),
             create_test_filesystem_accessor(&iceberg_table_config),
         )
@@ -483,8 +484,8 @@ impl TestEnvironment {
         assert_wal_events_does_not_contain(&wal_events, should_not_contain_table_events);
     }
 
-    pub async fn get_latest_wal_metadata(&self) -> PersistentWalMetadata {
-        WalManager::recover_persistent_wal_metadata(self.wal_filesystem_accessor.clone()).await
+    pub async fn get_latest_wal_metadata(&self) -> Option<PersistentWalMetadata> {
+        WalManager::recover_from_persistent_wal_metadata(self.wal_filesystem_accessor.clone()).await
     }
 
     pub async fn check_wal_events_from_metadata(
