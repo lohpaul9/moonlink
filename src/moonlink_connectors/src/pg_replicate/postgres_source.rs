@@ -337,10 +337,7 @@ impl CdcStream {
 
     pub fn add_table_schema(self: Pin<&mut Self>, schema: TableSchema) {
         let this = self.project();
-        assert!(this
-            .table_schemas
-            .insert(schema.src_table_id, schema)
-            .is_none());
+        this.table_schemas.insert(schema.src_table_id, schema);
     }
 
     pub fn remove_table_schema(self: Pin<&mut Self>, src_table_id: SrcTableId) {
