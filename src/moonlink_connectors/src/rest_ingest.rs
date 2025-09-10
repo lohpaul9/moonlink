@@ -21,7 +21,7 @@ use more_asserts as ma;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, warn};
+use tracing::{debug, warn, error};
 
 pub type SrcTableId = u32;
 
@@ -218,23 +218,38 @@ pub async fn run_rest_event_loop(
                         event_sender,
                         commit_lsn_tx,
                     };
-                    sink.add_table(src_table_id, table_status, persist_lsn)?;
+                    if let Err(e) = sink.add_table(src_table_id, table_status, persist_lsn) {
+                        error!("Add table {src_table_id} to sink failed: {e}");
+                        continue;
+                    }
 
                     // Add to source (handles schema and request processing)
-                    rest_source.add_table(src_table_name.clone(), src_table_id, schema, persist_lsn)?;
+                    if let Err(e) = rest_source.add_table(src_table_name.clone(), src_table_id, schema, persist_lsn) {
+                        error!("Add table {src_table_id} to rest source failed: {e}");
+                        continue;
+                    }
                 }
                 RestCommand::SetAvroSchema { src_table_name, avro_schema } => {
                     debug!("Setting Avro schema for table '{}'", src_table_name);
-                    rest_source.set_avro_schema(src_table_name.clone(), avro_schema)?;
+                    if let Err(e) = rest_source.set_avro_schema(src_table_name.clone(), avro_schema) {
+                        error!("Set avro schema failed for {src_table_name} failed: {e}");
+                        continue;
+                    }
                 }
                 RestCommand::DropTable { src_table_name, src_table_id } => {
                     debug!("Dropping REST table '{}' with src_table_id {}", src_table_name, src_table_id);
 
                     // Remove from sink
-                    sink.drop_table(src_table_id)?;
+                    if let Err(e) = sink.drop_table(src_table_id) {
+                        error!("Drop table {src_table_id} failed: {e}");
+                        continue;
+                    }
 
                     // Remove from source
-                    rest_source.remove_table(&src_table_name)?;
+                    if let Err(e) = rest_source.remove_table(&src_table_name) {
+                        error!("Remove table {src_table_name} failed: {e}");
+                        continue;
+                    }
                 }
                 RestCommand::Shutdown => {
                     debug!("received shutdown command");
@@ -260,7 +275,7 @@ pub async fn run_rest_event_loop(
                             let rest_event_proc_result = sink.process_rest_event(rest_event).await;
                             if let Err(e) = &rest_event_proc_result {
                                 warn!(error = ?e, "failed to process REST event");
-                                break; // Stop processing further events on error
+                                continue;
                             }
                         }
 

@@ -688,7 +688,7 @@ async fn set_avro_schema(
     State(state): State<ApiState>,
     Json(payload): Json<SetAvroSchemaRequest>,
 ) -> Result<Json<SetAvroSchemaResponse>, (StatusCode, Json<ErrorResponse>)> {
-    debug!(
+    info!(
         "Received Kafka schema creation request for '{}': {:?}",
         src_table_name, payload
     );
@@ -732,7 +732,7 @@ async fn set_avro_schema(
                 .kafka_schema_id_cache
                 .write()
                 .await
-                .insert(payload.kafka_schema, payload.schema_id);
+                .insert(payload.table.clone(), payload.schema_id);
             Ok(Json(SetAvroSchemaResponse {
                 database: payload.database,
                 table: payload.table,
