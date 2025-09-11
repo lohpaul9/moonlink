@@ -21,7 +21,7 @@ use more_asserts as ma;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, warn, error};
+use tracing::{debug, error, warn};
 
 pub type SrcTableId = u32;
 
